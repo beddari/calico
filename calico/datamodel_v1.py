@@ -161,6 +161,12 @@ class EndpointId(object):
         self.workload = intern(workload.encode("utf8"))
         self.endpoint = intern(endpoint.encode("utf8"))
 
+    @property
+    def path_for_status(self):
+        return "/".join([FELIX_STATUS_DIR, self.host,
+                         "workload", self.orchestrator, self.workload,
+                         "endpoint", self.endpoint])
+
     def __str__(self):
         return self.__class__.__name__ + ("<%s>" % self.endpoint)
 

@@ -39,7 +39,8 @@ class EndpointManager(ReferenceManager):
     def __init__(self, config, ip_type,
                  iptables_updater,
                  dispatch_chains,
-                 rules_manager):
+                 rules_manager,
+                 datastore_api):
         super(EndpointManager, self).__init__(qualifier=ip_type)
 
         # Configuration and version to use
@@ -51,6 +52,7 @@ class EndpointManager(ReferenceManager):
         self.iptables_updater = iptables_updater
         self.dispatch_chains = dispatch_chains
         self.rules_mgr = rules_manager
+        self.datastore_api = datastore_api
 
         # All endpoint dicts that are on this host.
         self.endpoints_by_id = {}
@@ -70,7 +72,8 @@ class EndpointManager(ReferenceManager):
                              self.ip_type,
                              self.iptables_updater,
                              self.dispatch_chains,
-                             self.rules_mgr)
+                             self.rules_mgr,
+                             self.datastore_api)
 
     def _on_object_started(self, endpoint_id, obj):
         """
@@ -169,7 +172,7 @@ class EndpointManager(ReferenceManager):
 class LocalEndpoint(RefCountedActor):
 
     def __init__(self, config, combined_id, ip_type, iptables_updater,
-                 dispatch_chains, rules_manager):
+                 dispatch_chains, rules_manager, datastore_api):
         """
         Controls a single local endpoint.
 
@@ -198,6 +201,7 @@ class LocalEndpoint(RefCountedActor):
         self.rules_mgr = rules_manager
         self.rules_ref_helper = RefHelper(self, rules_manager,
                                           self._on_profiles_ready)
+        self.datastore_api = datastore_api
 
         # Will be filled in as we learn about the OS interface and the
         # endpoint config.
@@ -329,7 +333,8 @@ class LocalEndpoint(RefCountedActor):
                 _log.info("%s became ready to program.", self)
                 self._update_chains()
                 self.dispatch_chains.on_endpoint_added(
-                    self._iface_name, async=True)
+                    self._iface_name, async=True
+                )
             else:
                 # We were active but now we're not, withdraw the dispatch rule
                 # and our chain.  We must do this to allow iptables to remove
@@ -340,6 +345,11 @@ class LocalEndpoint(RefCountedActor):
                 self.dispatch_chains.on_endpoint_removed(ifce_name,
                                                          async=True)
                 self._remove_chains()
+            self.datastore_api.on_endpoint_status_changed(
+                self._id,
+                {"status": "up" if is_ready and not self._failed else "down"},
+                async=True,
+            )
             self._dirty = False
 
     def _update_chains(self):

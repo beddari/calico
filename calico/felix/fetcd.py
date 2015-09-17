@@ -33,6 +33,7 @@ from etcd import EtcdException, EtcdKeyNotFound
 import gevent
 import sys
 from gevent.event import Event
+from gevent.lock import Semaphore
 import urllib3.exceptions
 from urllib3.exceptions import ReadTimeoutError, ConnectTimeoutError
 
@@ -119,12 +120,24 @@ class EtcdAPI(EtcdClientOwner, Actor):
         self._resync_greenlet = gevent.spawn(self._periodically_resync)
         self._resync_greenlet.link_exception(self._on_worker_died)
 
-        # Start up a reporting greenlet.
+        # Start up greenlet to report felix's liveness into etcd.
         self.done_first_status_report = False
         self._status_reporting_greenlet = gevent.spawn(
             self._periodically_report_status
         )
         self._status_reporting_greenlet.link_exception(self._on_worker_died)
+
+        # Start up a greenlet to report per-endpoint status into etcd.
+        self._endpoint_status = {}
+        self._dirty_endpoints = set()
+        self._endpoint_status_lock = Semaphore()
+        self._endpoint_status_work_to_do = Event()
+        self._per_endpoint_reporting_greenlet = gevent.spawn(
+            self._report_endpoint_status
+        )
+        self._per_endpoint_reporting_greenlet.link_exception(
+            self._on_worker_died
+        )
 
     @logging_exceptions
     def _periodically_resync(self):
@@ -188,6 +201,58 @@ class EtcdAPI(EtcdClientOwner, Actor):
                 sleep_time = interval + jitter
                 gevent.sleep(sleep_time)
 
+    @logging_exceptions
+    def _report_endpoint_status(self):
+        while True:
+            # Wait for some work to do, then clear the flag ready for next
+            # time.  There is no race here with someone else setting the flag
+            # again because the flag is only set after the shared data
+            # structure is updated and we don't read it until after we've
+            # cleared the flag.
+            self._endpoint_status_work_to_do.wait()
+            self._endpoint_status_work_to_do.clear()
+            with self._endpoint_status_lock:
+                # This lock is probably not required in gevent due to lack of
+                # yield points in this code.  It is required in normal python,
+                # since, otherwise, _mark_endpoint_dirty could dereference
+                # self._dirty_endpoints, then get de-scheduled and
+                # subsequently write to the set after we start iterating over
+                # it.
+                dirty_endpoints = self._dirty_endpoints
+                self._dirty_endpoints = set()
+            for ep_id in dirty_endpoints:
+                status = self._endpoint_status.get(ep_id)
+                try:
+                    self.write_endpoint_status_to_etcd(ep_id, status)
+                except (ReadTimeoutError,
+                        SocketTimeout,
+                        ConnectTimeoutError,
+                        urllib3.exceptions.HTTPError,
+                        httplib.HTTPException,
+                        EtcdException):
+                    _log.error("Failed to report status for %s, will retry",
+                               ep_id)
+                    # Add it into the next dirty set.  Retrying in the next
+                    # batch ensures that we try to update all of the dirty
+                    # endpoints before we do any retries, ensuring fairness.
+                    self._mark_endpoint_dirty(ep_id)
+                gevent.sleep(1 + random.random())  # Rate-limit writes to etcd
+
+    def _mark_endpoint_dirty(self, ep_id):
+        with self._endpoint_status_lock:
+            self._dirty_endpoints.add(ep_id)
+            self._endpoint_status_work_to_do.set()
+
+    def write_endpoint_status_to_etcd(self, ep_id, status):
+        if status:
+            self.client.set(ep_id.path_for_status,
+                            json.dumps(status))
+        else:
+            try:
+                self.client.delete(ep_id.path_for_status)
+            except (EtcdKeyNotFound, KeyError):
+                pass  # Already gone.
+
     def _update_felix_status(self, ttl):
         """
         Writes two keys to etcd:
@@ -245,6 +310,18 @@ class EtcdAPI(EtcdClientOwner, Actor):
         """
         _log.info("Forcing a resync from etcd.  Reason: %s.", reason)
         self._watcher.resync_after_current_poll = True
+
+    @actor_message()
+    def on_endpoint_status_changed(self, endpoint_id, status):
+        # We directly update the shared data-structure, which is safe as long
+        # as the reporting thread only does exact reads (and not iteration,
+        # say).
+        if status:
+            self._endpoint_status[endpoint_id] = status
+        else:
+            self._endpoint_status.pop(endpoint_id, None)
+        # Then we wake up the reporting thread.
+        self._mark_endpoint_dirty(endpoint_id)
 
     def _on_worker_died(self, watch_greenlet):
         """
